@@ -1,0 +1,6 @@
+/target/
+.rql_history
+*.swp
+*.swo
+.DS_Store
+
