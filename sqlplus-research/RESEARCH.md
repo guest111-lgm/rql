@@ -64,17 +64,31 @@ multiline prompts, and persistent history are follow-up work.
 
 ### Dynamic completion
 
-The editor can merge static candidates with one candidate per line from a
-local cache named by `SQLPLUS_LFIRD_COMPLETION_FILE`. It fingerprints the file
-and reloads it when the file changes, so a running SQL*Plus process can see a
-new cache on the next Tab without restarting.
+The editor can merge static candidates with records from a local cache named
+by `SQLPLUS_LFIRD_COMPLETION_FILE`. The cache is fingerprinted by path, inode,
+size, and modification time and is reloaded after an atomic replacement, so a
+running SQL*Plus process can see a new snapshot on the next Tab without
+restarting. The old one-word-per-line format remains accepted.
 
-The supplied refresh example performs read-only metadata queries for names in
-`ALL_OBJECTS` and `ALL_SYNONYMS`. A separate `ALL_TAB_COLUMNS` query is shown
-for column completion. These views expose metadata according to the session's
-visibility and privileges; a cache refreshed under another account may give
-surprising or incomplete results. The cache is intentionally external to the
-Oracle installation.
+The structured format stores object owner/name/type, synonym owner/name and
+target, column owner/table/name/order, and `CURRENT_SCHEMA`. Completion uses
+these records to distinguish object context (`FROM APP.`), owner completion
+(`FROM AP`), and column context (`SELECT c.NA ... FROM APP.CLIENTS c`).
+Private/public synonym preference and nested synonym resolution are bounded
+and cache-only; a database link is not followed.
+
+The SQL recognizer is intentionally conservative. It skips quoted string
+literals and comments, recognizes common relation and column clauses, and
+collects simple `FROM`/`JOIN` relations and aliases from the current input
+line. It does not reconstruct SQL*Plus's multi-line SQL buffer or implement a
+complete Oracle SQL grammar.
+
+The supplied refresh example performs read-only metadata queries for
+`ALL_OBJECTS`, `ALL_SYNONYMS`, and `ALL_TAB_COLUMNS`. These views expose
+metadata according to the session's visibility and privileges; a cache
+refreshed under another account or current schema may give surprising or
+incomplete results. The cache is intentionally external to the Oracle
+installation and is written with a private umask followed by an atomic rename.
 
 ## Verification matrix
 
@@ -96,8 +110,8 @@ operator action.
 2. Add a configuration file or generated manifest instead of hard-coding one
    client build into a production launcher.
 3. Make terminal rendering width-aware and robust for long or multibyte lines.
-4. Add SQL-aware context parsing for `OWNER.TABLE`, aliases, quoted names,
-   and column completion.
+4. Extend SQL-aware context parsing for quoted names, CTEs, nested queries,
+   and multi-line SQL*Plus input if those cases are required.
 5. Define cache ownership, permissions, refresh cadence, and stale-data
    behavior before using dynamic completion in a shared environment.
 6. Test under the exact libc, compiler, terminal multiplexer, and Oracle
@@ -110,4 +124,3 @@ with a properly licensed client and an isolated process-level environment.
 There is no claim of compatibility or support from Oracle. Review the license
 and redistribution terms of every dependency and client component before
 sharing or deploying the result.
-

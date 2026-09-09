@@ -1,9 +1,9 @@
 *.o
 *.so
 sqlplus-line-editor
+context-test
 lfird_interpose_test
 load_core
 lfird_shape_probe
 examples/objects.cache
 examples/objects.cache.*
-

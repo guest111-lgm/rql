@@ -1,25 +1,15 @@
 #define _GNU_SOURCE
 
+#include "completion_cache.h"
 #include "line_editor.h"
+#include "sql_context.h"
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-
-#define LE_DYNAMIC_WORD_MAX 256
-#define LE_DYNAMIC_WORDS_MAX 4096
 
 static void write_all(int fd, const void *data, size_t length)
 {
@@ -106,11 +96,6 @@ static int read_byte_timeout(int fd, unsigned char *value, int timeout_ms)
     }
 }
 
-static int is_identifier_byte(unsigned char value)
-{
-    return isalnum(value) || value == '_' || value == '$' || value == '#';
-}
-
 static int ascii_equal_fold(unsigned char left, unsigned char right)
 {
     if (left >= 'a' && left <= 'z')
@@ -142,19 +127,42 @@ static size_t static_word_count(void)
     return sizeof(static_words) / sizeof(static_words[0]);
 }
 
-static char dynamic_words[LE_DYNAMIC_WORDS_MAX][LE_DYNAMIC_WORD_MAX];
-static size_t dynamic_word_count;
-
-struct dynamic_cache_stamp {
-    int valid;
-    dev_t device;
-    ino_t inode;
-    off_t size;
-    time_t modified;
-    char path[PATH_MAX];
+enum {
+    LE_COMPLETION_CANDIDATES_MAX = 256,
+    LE_RESOLVED_TARGETS_MAX = 128,
+    LE_RESOLUTION_VISITED_MAX = 32
 };
 
-static struct dynamic_cache_stamp dynamic_cache_stamp;
+typedef struct le_completion_candidate {
+    const char *display;
+    size_t display_length;
+    const char *insert;
+    size_t insert_length;
+    int display_dot;
+    int insert_dot;
+} le_completion_candidate;
+
+typedef struct le_completion_set {
+    le_completion_candidate items[LE_COMPLETION_CANDIDATES_MAX];
+    size_t count;
+    int overflow;
+} le_completion_set;
+
+typedef struct le_resolved_target {
+    char owner[LE_CONTEXT_NAME_MAX];
+    char name[LE_CONTEXT_NAME_MAX];
+} le_resolved_target;
+
+typedef struct le_resolution_state {
+    const le_cache *cache;
+    le_resolved_target targets[LE_RESOLVED_TARGETS_MAX];
+    size_t target_count;
+    le_resolved_target visited[LE_RESOLUTION_VISITED_MAX];
+    size_t visited_count;
+} le_resolution_state;
+
+static le_cache completion_cache;
+static int completion_cache_initialized;
 
 static int completion_word_equal(const char *left, const char *right)
 {
@@ -172,124 +180,7 @@ static int completion_word_equal(const char *left, const char *right)
     return 1;
 }
 
-static int completion_word_start(unsigned char value)
-{
-    return (value >= 'A' && value <= 'Z') ||
-           (value >= 'a' && value <= 'z') || value == '_';
-}
-
-static void add_dynamic_word(const char *word, size_t length)
-{
-    char candidate[LE_DYNAMIC_WORD_MAX];
-    size_t start = 0;
-    size_t end = length;
-    size_t i;
-
-    while (start < end && (word[start] == ' ' || word[start] == '\t'))
-        ++start;
-    while (end > start && (word[end - 1] == ' ' || word[end - 1] == '\t'))
-        --end;
-    length = end - start;
-    if (length == 0 || length >= LE_DYNAMIC_WORD_MAX ||
-        !completion_word_start((unsigned char)word[start]))
-        return;
-    for (i = 0; i < length; ++i) {
-        if (!is_identifier_byte((unsigned char)word[start + i]))
-            return;
-    }
-    memcpy(candidate, word + start, length);
-    candidate[length] = '\0';
-    for (i = 0; i < dynamic_word_count; ++i) {
-        if (completion_word_equal(dynamic_words[i], candidate))
-            return;
-    }
-    if (dynamic_word_count == LE_DYNAMIC_WORDS_MAX)
-        return;
-    memcpy(dynamic_words[dynamic_word_count], candidate, length + 1);
-    ++dynamic_word_count;
-}
-
-static int dynamic_stamp_matches(const char *path, const struct stat *status)
-{
-    return dynamic_cache_stamp.valid &&
-           strcmp(dynamic_cache_stamp.path, path) == 0 &&
-           dynamic_cache_stamp.device == status->st_dev &&
-           dynamic_cache_stamp.inode == status->st_ino &&
-           dynamic_cache_stamp.size == status->st_size &&
-           dynamic_cache_stamp.modified == status->st_mtime;
-}
-
-static void load_dynamic_words(void)
-{
-    const char *path = getenv("SQLPLUS_LFIRD_COMPLETION_FILE");
-    struct stat status;
-    char word[LE_DYNAMIC_WORD_MAX];
-    unsigned char buffer[4096];
-    size_t word_length = 0;
-    int overflow = 0;
-    int fd;
-
-    if (path == NULL || path[0] == '\0') {
-        dynamic_word_count = 0;
-        memset(&dynamic_cache_stamp, 0, sizeof(dynamic_cache_stamp));
-        return;
-    }
-    if (strlen(path) >= sizeof(dynamic_cache_stamp.path) ||
-        stat(path, &status) != 0 || !S_ISREG(status.st_mode)) {
-        dynamic_word_count = 0;
-        memset(&dynamic_cache_stamp, 0, sizeof(dynamic_cache_stamp));
-        strncpy(dynamic_cache_stamp.path, path,
-                sizeof(dynamic_cache_stamp.path) - 1);
-        return;
-    }
-    if (dynamic_stamp_matches(path, &status))
-        return;
-
-    dynamic_word_count = 0;
-    fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        for (;;) {
-            ssize_t count = read(fd, buffer, sizeof(buffer));
-            ssize_t i;
-
-            if (count == 0)
-                break;
-            if (count < 0) {
-                if (errno == EINTR)
-                    continue;
-                break;
-            }
-            for (i = 0; i < count; ++i) {
-                unsigned char value = buffer[i];
-                if (value == '\n' || value == '\r') {
-                    if (!overflow)
-                        add_dynamic_word(word, word_length);
-                    word_length = 0;
-                    overflow = 0;
-                } else if (!overflow) {
-                    if (word_length + 1 < sizeof(word))
-                        word[word_length++] = (char)value;
-                    else
-                        overflow = 1;
-                }
-            }
-        }
-        if (!overflow && word_length != 0)
-            add_dynamic_word(word, word_length);
-        close(fd);
-    }
-
-    dynamic_cache_stamp.valid = fd >= 0;
-    dynamic_cache_stamp.device = status.st_dev;
-    dynamic_cache_stamp.inode = status.st_ino;
-    dynamic_cache_stamp.size = status.st_size;
-    dynamic_cache_stamp.modified = status.st_mtime;
-    strncpy(dynamic_cache_stamp.path, path,
-            sizeof(dynamic_cache_stamp.path) - 1);
-    dynamic_cache_stamp.path[sizeof(dynamic_cache_stamp.path) - 1] = '\0';
-}
-
-static int word_has_prefix(const char *word, const char *line,
+static int text_has_prefix(const char *word, const char *line,
                            size_t start, size_t cursor)
 {
     size_t word_length = strlen(word);
@@ -306,18 +197,46 @@ static int word_has_prefix(const char *word, const char *line,
     return 1;
 }
 
-static void consider_completion(const char *word, const char *line,
-                                size_t start, size_t cursor,
-                                const char **match, size_t *match_count)
+static void completion_set_add(le_completion_set *set, const char *display,
+                               size_t display_length, const char *insert,
+                               size_t insert_length, int display_dot,
+                               int insert_dot)
 {
-    if (!word_has_prefix(word, line, start, cursor))
+    size_t i;
+
+    if (display == NULL || display_length == 0)
         return;
-    if (*match == NULL) {
-        *match = word;
-        *match_count = 1;
-    } else if (!completion_word_equal(*match, word)) {
-        ++*match_count;
+    for (i = 0; i < set->count; ++i) {
+        if (set->items[i].display_length == display_length &&
+            set->items[i].display_dot == display_dot &&
+            completion_word_equal(set->items[i].display, display))
+            return;
     }
+    if (set->count == LE_COMPLETION_CANDIDATES_MAX) {
+        set->overflow = 1;
+        return;
+    }
+    set->items[set->count].display = display;
+    set->items[set->count].display_length = display_length;
+    set->items[set->count].insert = insert;
+    set->items[set->count].insert_length = insert_length;
+    set->items[set->count].display_dot = display_dot;
+    set->items[set->count].insert_dot = insert_dot;
+    ++set->count;
+}
+
+static int add_matching_candidate(le_completion_set *set, const char *word,
+                                  const char *line, size_t start, size_t cursor,
+                                  int display_dot, int insert_dot)
+{
+    size_t prefix_length = cursor - start;
+    size_t word_length = strlen(word);
+
+    if (!text_has_prefix(word, line, start, cursor))
+        return 0;
+    completion_set_add(set, word, word_length, word + prefix_length,
+                       word_length - prefix_length, display_dot, insert_dot);
+    return 1;
 }
 
 static int insert_bytes(char *line, size_t *length, size_t *cursor,
@@ -333,53 +252,359 @@ static int insert_bytes(char *line, size_t *length, size_t *cursor,
     return 1;
 }
 
+static int object_type_is_completable(const char *type)
+{
+    return completion_word_equal(type, "TABLE") ||
+           completion_word_equal(type, "VIEW") ||
+           completion_word_equal(type, "MATERIALIZED VIEW") ||
+           completion_word_equal(type, "SEQUENCE");
+}
+
+static void ensure_completion_cache(void)
+{
+    if (!completion_cache_initialized) {
+        le_cache_init(&completion_cache);
+        completion_cache_initialized = 1;
+    }
+    le_cache_ensure(&completion_cache,
+                    getenv("SQLPLUS_LFIRD_COMPLETION_FILE"));
+}
+
+static void add_legacy_words(le_completion_set *set, const le_sql_context *context,
+                             const char *line, size_t cursor)
+{
+    size_t i;
+
+    for (i = 0; i < completion_cache.word_count; ++i)
+        add_matching_candidate(set,
+                               le_cache_text(&completion_cache,
+                                             completion_cache.words[i].name),
+                               line, context->component_start, cursor, 0, 0);
+}
+
+static void add_generic_objects(le_completion_set *set,
+                                const le_sql_context *context,
+                                const char *line, size_t cursor)
+{
+    size_t i;
+
+    for (i = 0; i < completion_cache.object_count; ++i) {
+        const le_cache_object *object = &completion_cache.objects[i];
+        if (object_type_is_completable(
+                le_cache_text(&completion_cache, object->type)))
+            add_matching_candidate(
+                set, le_cache_text(&completion_cache, object->name), line,
+                context->component_start, cursor, 0, 0);
+    }
+    for (i = 0; i < completion_cache.synonym_count; ++i) {
+        const le_cache_synonym *synonym = &completion_cache.synonyms[i];
+        add_matching_candidate(
+            set, le_cache_text(&completion_cache, synonym->name), line,
+            context->component_start, cursor, 0, 0);
+    }
+}
+
+static void add_static_candidates(le_completion_set *set,
+                                  const le_sql_context *context,
+                                  const char *line, size_t cursor)
+{
+    size_t i;
+
+    for (i = 0; i < static_word_count(); ++i)
+        add_matching_candidate(set, static_words[i], line,
+                               context->component_start, cursor, 0, 0);
+}
+
+static void add_object_candidates(le_completion_set *set,
+                                  const le_sql_context *context,
+                                  const char *line, size_t cursor)
+{
+    const char *owner = NULL;
+    size_t i;
+    int structured_match = 0;
+
+    if (context->component_count == 2)
+        owner = context->components[0];
+    if (context->component_count <= 2) {
+        for (i = 0; i < completion_cache.object_count; ++i) {
+            const le_cache_object *object = &completion_cache.objects[i];
+            const char *object_owner =
+                le_cache_text(&completion_cache, object->owner);
+            if (!object_type_is_completable(
+                    le_cache_text(&completion_cache, object->type)) ||
+                (owner != NULL && !completion_word_equal(object_owner, owner)))
+                continue;
+            if (add_matching_candidate(
+                    set, le_cache_text(&completion_cache, object->name), line,
+                    context->component_start, cursor, 0, 0))
+                structured_match = 1;
+        }
+        for (i = 0; i < completion_cache.synonym_count; ++i) {
+            const le_cache_synonym *synonym = &completion_cache.synonyms[i];
+            const char *synonym_owner =
+                le_cache_text(&completion_cache, synonym->owner);
+            if (owner != NULL && !completion_word_equal(synonym_owner, owner))
+                continue;
+            if (add_matching_candidate(
+                    set, le_cache_text(&completion_cache, synonym->name), line,
+                    context->component_start, cursor, 0, 0))
+                structured_match = 1;
+        }
+    }
+
+    /* If the first component is an owner, completing it adds the dot. */
+    if (context->component_count == 1 && !structured_match) {
+        for (i = 0; i < completion_cache.object_count; ++i) {
+            const char *object_owner = le_cache_text(
+                &completion_cache, completion_cache.objects[i].owner);
+            add_matching_candidate(set, object_owner, line,
+                                   context->component_start, cursor, 1, 1);
+        }
+        for (i = 0; i < completion_cache.synonym_count; ++i) {
+            const char *synonym_owner = le_cache_text(
+                &completion_cache, completion_cache.synonyms[i].owner);
+            add_matching_candidate(set, synonym_owner, line,
+                                   context->component_start, cursor, 1, 1);
+        }
+    }
+
+    add_legacy_words(set, context, line, cursor);
+    /* DUAL is useful even when the cache contains no object row for it. */
+    if (context->component_count == 1)
+        add_matching_candidate(set, "DUAL", line, context->component_start,
+                               cursor, 0, 0);
+}
+
+static int target_equal(const le_resolved_target *target, const char *owner,
+                        const char *name)
+{
+    return completion_word_equal(target->owner, owner) &&
+           completion_word_equal(target->name, name);
+}
+
+static void add_target(le_resolution_state *state, const char *owner,
+                       const char *name)
+{
+    size_t i;
+
+    if (owner[0] == '\0' || name[0] == '\0')
+        return;
+    for (i = 0; i < state->target_count; ++i) {
+        if (target_equal(&state->targets[i], owner, name))
+            return;
+    }
+    if (state->target_count == LE_RESOLVED_TARGETS_MAX)
+        return;
+    strncpy(state->targets[state->target_count].owner, owner,
+            sizeof(state->targets[0].owner) - 1);
+    state->targets[state->target_count].owner[
+        sizeof(state->targets[0].owner) - 1] = '\0';
+    strncpy(state->targets[state->target_count].name, name,
+            sizeof(state->targets[0].name) - 1);
+    state->targets[state->target_count].name[
+        sizeof(state->targets[0].name) - 1] = '\0';
+    ++state->target_count;
+}
+
+static int visited_target(const le_resolution_state *state, const char *owner,
+                          const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < state->visited_count; ++i) {
+        if (target_equal(&state->visited[i], owner, name))
+            return 1;
+    }
+    return 0;
+}
+
+static void resolve_exact(le_resolution_state *state, const char *owner,
+                          const char *name, size_t depth)
+{
+    const le_cache *cache = state->cache;
+    size_t i;
+
+    if (owner[0] == '\0' || name[0] == '\0' ||
+        depth > LE_RESOLUTION_VISITED_MAX || visited_target(state, owner, name))
+        return;
+    if (state->visited_count == LE_RESOLUTION_VISITED_MAX)
+        return;
+    strncpy(state->visited[state->visited_count].owner, owner,
+            sizeof(state->visited[0].owner) - 1);
+    state->visited[state->visited_count].owner[
+        sizeof(state->visited[0].owner) - 1] = '\0';
+    strncpy(state->visited[state->visited_count].name, name,
+            sizeof(state->visited[0].name) - 1);
+    state->visited[state->visited_count].name[
+        sizeof(state->visited[0].name) - 1] = '\0';
+    ++state->visited_count;
+
+    for (i = 0; i < cache->object_count; ++i) {
+        const le_cache_object *object = &cache->objects[i];
+        if (completion_word_equal(le_cache_text(cache, object->owner), owner) &&
+            completion_word_equal(le_cache_text(cache, object->name), name) &&
+            object_type_is_completable(le_cache_text(cache, object->type)) &&
+            !completion_word_equal(le_cache_text(cache, object->type),
+                                   "SEQUENCE")) {
+            add_target(state, owner, name);
+        }
+    }
+    for (i = 0; i < cache->synonym_count; ++i) {
+        const le_cache_synonym *synonym = &cache->synonyms[i];
+        const char *synonym_owner = le_cache_text(cache, synonym->owner);
+        const char *synonym_name = le_cache_text(cache, synonym->name);
+        const char *table_owner = le_cache_text(cache, synonym->table_owner);
+        const char *table_name = le_cache_text(cache, synonym->table_name);
+        if (!completion_word_equal(synonym_owner, owner) ||
+            !completion_word_equal(synonym_name, name) ||
+            le_cache_text(cache, synonym->db_link)[0] != '\0')
+            continue;
+        add_target(state, table_owner, table_name);
+        if (depth < LE_RESOLUTION_VISITED_MAX)
+            resolve_exact(state, table_owner, table_name, depth + 1);
+    }
+}
+
+static void resolve_relation(le_resolution_state *state, const char *owner,
+                             const char *name)
+{
+    const le_cache *cache = state->cache;
+    const char *current_schema = le_cache_current_schema(cache);
+    size_t before = state->target_count;
+    size_t i;
+
+    if (owner[0] != '\0') {
+        resolve_exact(state, owner, name, 0);
+        return;
+    }
+    if (current_schema[0] != '\0')
+        resolve_exact(state, current_schema, name, 0);
+    if (state->target_count != before)
+        return;
+    resolve_exact(state, "PUBLIC", name, 0);
+    if (state->target_count != before)
+        return;
+    for (i = 0; i < cache->object_count; ++i) {
+        const le_cache_object *object = &cache->objects[i];
+        if (completion_word_equal(le_cache_text(cache, object->name), name))
+            resolve_exact(state, le_cache_text(cache, object->owner), name, 0);
+    }
+    for (i = 0; i < cache->synonym_count; ++i) {
+        const le_cache_synonym *synonym = &cache->synonyms[i];
+        if (completion_word_equal(le_cache_text(cache, synonym->name), name))
+            resolve_exact(state, le_cache_text(cache, synonym->owner), name, 0);
+    }
+}
+
+static int relation_qualifier_matches(const le_context_relation *relation,
+                                      const char *qualifier)
+{
+    return completion_word_equal(relation->alias, qualifier) ||
+           (relation->alias[0] == '\0' &&
+            completion_word_equal(relation->name, qualifier));
+}
+
+static void add_columns_for_target(le_completion_set *set,
+                                   const le_resolved_target *target,
+                                   const le_sql_context *context,
+                                   const char *line, size_t cursor)
+{
+    size_t i;
+
+    for (i = 0; i < completion_cache.column_count; ++i) {
+        const le_cache_column *column = &completion_cache.columns[i];
+        if (!completion_word_equal(
+                le_cache_text(&completion_cache, column->owner),
+                target->owner) ||
+            !completion_word_equal(
+                le_cache_text(&completion_cache, column->table_name),
+                target->name))
+            continue;
+        add_matching_candidate(
+            set, le_cache_text(&completion_cache, column->name), line,
+            context->component_start, cursor, 0, 0);
+    }
+}
+
+static void add_column_candidates(le_completion_set *set,
+                                  const le_sql_context *context,
+                                  const char *line, size_t cursor)
+{
+    le_resolution_state state;
+    size_t i;
+    int relation_matched = 0;
+
+    memset(&state, 0, sizeof(state));
+    state.cache = &completion_cache;
+    if (context->component_count == 1) {
+        for (i = 0; i < context->relation_count; ++i)
+            resolve_relation(&state, context->relations[i].owner,
+                             context->relations[i].name);
+    } else if (context->component_count == 2) {
+        for (i = 0; i < context->relation_count; ++i) {
+            if (relation_qualifier_matches(&context->relations[i],
+                                           context->components[0])) {
+                resolve_relation(&state, context->relations[i].owner,
+                                 context->relations[i].name);
+                relation_matched = 1;
+            }
+        }
+        if (!relation_matched)
+            resolve_relation(&state, "", context->components[0]);
+    } else if (context->component_count == 3) {
+        resolve_relation(&state, context->components[0],
+                         context->components[1]);
+    }
+    for (i = 0; i < state.target_count; ++i)
+        add_columns_for_target(set, &state.targets[i], context, line, cursor);
+}
+
+static void write_candidate(int output_fd,
+                            const le_completion_candidate *candidate)
+{
+    write_all(output_fd, candidate->display, candidate->display_length);
+    if (candidate->display_dot)
+        write_literal(output_fd, ".");
+    write_literal(output_fd, "  ");
+}
+
 static int complete_word(char *line, size_t *length, size_t *cursor,
                          size_t capacity, int output_fd, const char *prompt,
                          size_t *old_cursor)
 {
-    size_t start = *cursor;
+    le_sql_context context;
+    le_completion_set set;
     size_t i;
-    const char *match = NULL;
-    size_t match_count = 0;
-    size_t word_length;
-    size_t prefix_length;
 
-    while (start != 0 && is_identifier_byte((unsigned char)line[start - 1]))
-        --start;
-    prefix_length = *cursor - start;
-    if (prefix_length == 0) {
+    memset(&set, 0, sizeof(set));
+    if (!le_sql_context_analyze(line, *cursor, &context) ||
+        context.disabled ||
+        (context.component_start == *cursor && *cursor != 0 &&
+         line[*cursor - 1] != ' ' && line[*cursor - 1] != '\t' &&
+         line[*cursor - 1] != '.')) {
         bell(output_fd);
         return 0;
     }
-
-    load_dynamic_words();
-    for (i = 0; i < static_word_count(); ++i) {
-        consider_completion(static_words[i], line, start, *cursor,
-                            &match, &match_count);
+    ensure_completion_cache();
+    if (context.kind == LE_CONTEXT_OBJECT)
+        add_object_candidates(&set, &context, line, *cursor);
+    else if (context.kind == LE_CONTEXT_COLUMN)
+        add_column_candidates(&set, &context, line, *cursor);
+    else {
+        add_static_candidates(&set, &context, line, *cursor);
+        add_legacy_words(&set, &context, line, *cursor);
+        add_generic_objects(&set, &context, line, *cursor);
     }
-    for (i = 0; i < dynamic_word_count; ++i) {
-        consider_completion(dynamic_words[i], line, start, *cursor,
-                            &match, &match_count);
-    }
 
-    if (match_count != 1) {
-        if (match_count > 1 && prompt != NULL && old_cursor != NULL) {
+    if (set.count != 1 || set.overflow) {
+        if ((set.count > 1 || set.overflow) && prompt != NULL &&
+            old_cursor != NULL) {
             cursor_left(output_fd, *old_cursor);
             write_literal(output_fd, "\033[K\r\n");
-            for (i = 0; i < static_word_count(); ++i) {
-                if (word_has_prefix(static_words[i], line, start, *cursor)) {
-                    write_all(output_fd, static_words[i],
-                              strlen(static_words[i]));
-                    write_literal(output_fd, "  ");
-                }
-            }
-            for (i = 0; i < dynamic_word_count; ++i) {
-                if (word_has_prefix(dynamic_words[i], line, start, *cursor)) {
-                    write_all(output_fd, dynamic_words[i],
-                              strlen(dynamic_words[i]));
-                    write_literal(output_fd, "  ");
-                }
-            }
+            for (i = 0; i < set.count; ++i)
+                write_candidate(output_fd, &set.items[i]);
+            if (set.overflow)
+                write_literal(output_fd, "...  ");
             write_literal(output_fd, "\r\n");
             write_all(output_fd, prompt, strlen(prompt));
             write_all(output_fd, line, *length);
@@ -390,12 +615,15 @@ static int complete_word(char *line, size_t *length, size_t *cursor,
         bell(output_fd);
         return 0;
     }
-
-    word_length = strlen(match);
-    if (word_length == prefix_length)
+    if (set.items[0].insert_length == 0 && !set.items[0].insert_dot)
         return 1;
     if (!insert_bytes(line, length, cursor, capacity,
-                      match + prefix_length, word_length - prefix_length)) {
+                      set.items[0].insert, set.items[0].insert_length)) {
+        bell(output_fd);
+        return 0;
+    }
+    if (set.items[0].insert_dot &&
+        !insert_bytes(line, length, cursor, capacity, ".", 1)) {
         bell(output_fd);
         return 0;
     }
